@@ -1,7 +1,7 @@
 name: Merge upstream branches
 on:
   schedule:
-    - cron:  '* * * * *'
+    - cron:  '0 13 * * *'
 jobs:
   merge:
     runs-on: ubuntu-latest
@@ -10,7 +10,7 @@ jobs:
       - name: Merge upstream
         run: |
           git config --global user.name 'Maseshi'
-          git config --global user.email 'Maseshi@users.noreply.github.com'
+          git config --global user.email 'dermhioasw123@gmail.com'
 
           git pull --unshallow
 
