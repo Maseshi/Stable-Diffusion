@@ -1,0 +1,22 @@
+name: Merge upstream branches
+on:
+  schedule:
+    - cron:  '* * * * *'
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Merge upstream
+        run: |
+          git config --global user.name 'Maseshi'
+          git config --global user.email 'Maseshi@users.noreply.github.com'
+
+          git pull --unshallow
+
+          git remote add upstream https://github.com/AUTOMATIC1111/stable-diffusion-webui.git
+          git fetch upstream
+
+          git checkout master
+          git merge --no-edit upstream/master
+          git push origin master
