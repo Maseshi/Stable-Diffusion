@@ -5,7 +5,7 @@ import os.path
 
 import gradio as gr
 
-from modules import generation_parameters_copypaste, images, sysinfo, errors, ui_extra_networks
+from modules import infotext_utils, images, sysinfo, errors, ui_extra_networks
 
 
 class UserMetadataEditor:
@@ -14,7 +14,7 @@ class UserMetadataEditor:
         self.ui = ui
         self.tabname = tabname
         self.page = page
-        self.id_part = f"{self.tabname}_{self.page.id_page}_edit_user_metadata"
+        self.id_part = f"{self.tabname}_{self.page.extra_networks_tabname}_edit_user_metadata"
 
         self.box = None
 
@@ -133,8 +133,10 @@ class UserMetadataEditor:
         filename = item.get("filename", None)
         basename, ext = os.path.splitext(filename)
 
-        with open(basename + '.json', "w", encoding="utf8") as file:
+        metadata_path = basename + '.json'
+        with open(metadata_path, "w", encoding="utf8") as file:
             json.dump(metadata, file, indent=4, ensure_ascii=False)
+        self.page.lister.update_file_entry(metadata_path)
 
     def save_user_metadata(self, name, desc, notes):
         user_metadata = self.get_user_metadata(name)
@@ -181,11 +183,12 @@ class UserMetadataEditor:
         index = len(gallery) - 1 if index >= len(gallery) else index
 
         img_info = gallery[index if index >= 0 else 0]
-        image = generation_parameters_copypaste.image_from_url_text(img_info)
+        image = infotext_utils.image_from_url_text(img_info)
         geninfo, items = images.read_info_from_image(image)
 
         images.save_image_with_geninfo(image, geninfo, item["local_preview"])
-
+        self.page.lister.update_file_entry(item["local_preview"])
+        item['preview'] = self.page.find_preview(item["local_preview"])
         return self.get_card_html(name), ''
 
     def setup_ui(self, gallery):
@@ -200,6 +203,3 @@ class UserMetadataEditor:
             inputs=[self.edit_name_input],
             outputs=[]
         )
-
-
-

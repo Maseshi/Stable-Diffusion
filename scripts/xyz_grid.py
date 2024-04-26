@@ -11,7 +11,7 @@ import numpy as np
 import modules.scripts as scripts
 import gradio as gr
 
-from modules import images, sd_samplers, processing, sd_models, sd_vae, sd_samplers_kdiffusion, errors
+from modules import images, sd_samplers, processing, sd_models, sd_vae, sd_schedulers, errors
 from modules.processing import process_images, Processed, StableDiffusionProcessingTxt2Img
 from modules.shared import opts, state
 import modules.shared as shared
@@ -45,7 +45,7 @@ def apply_prompt(p, x, xs):
 def apply_order(p, x, xs):
     token_order = []
 
-    # Initally grab the tokens from the prompt, so they can be replaced in order of earliest seen
+    # Initially grab the tokens from the prompt, so they can be replaced in order of earliest seen
     for token in x:
         token_order.append((p.prompt.find(token), token))
 
@@ -104,6 +104,17 @@ def apply_upscale_latent_space(p, x, xs):
         opts.data["use_scale_latent_for_hires_fix"] = True
     else:
         opts.data["use_scale_latent_for_hires_fix"] = False
+
+
+def apply_size(p, x: str, xs) -> None:
+    try:
+        width, _, height = x.partition('x')
+        width = int(width.strip())
+        height = int(height.strip())
+        p.width = width
+        p.height = height
+    except ValueError:
+        print(f"Invalid size in XYZ plot: {x}")
 
 
 def find_vae(name: str):
@@ -248,7 +259,7 @@ axis_options = [
     AxisOption("Sigma min", float, apply_field("s_tmin")),
     AxisOption("Sigma max", float, apply_field("s_tmax")),
     AxisOption("Sigma noise", float, apply_field("s_noise")),
-    AxisOption("Schedule type", str, apply_override("k_sched_type"), choices=lambda: list(sd_samplers_kdiffusion.k_diffusion_scheduler)),
+    AxisOption("Schedule type", str, apply_field("scheduler"), choices=lambda: [x.label for x in sd_schedulers.schedulers]),
     AxisOption("Schedule min sigma", float, apply_override("sigma_min")),
     AxisOption("Schedule max sigma", float, apply_override("sigma_max")),
     AxisOption("Schedule rho", float, apply_override("rho")),
@@ -270,6 +281,8 @@ axis_options = [
     AxisOption("Refiner checkpoint", str, apply_field('refiner_checkpoint'), format_value=format_remove_path, confirm=confirm_checkpoints_or_none, cost=1.0, choices=lambda: ['None'] + sorted(sd_models.checkpoints_list, key=str.casefold)),
     AxisOption("Refiner switch at", float, apply_field('refiner_switch_at')),
     AxisOption("RNG source", str, apply_override("randn_source"), choices=lambda: ["GPU", "CPU", "NV"]),
+    AxisOption("FP8 mode", str, apply_override("fp8_storage"), cost=0.9, choices=lambda: ["Disable", "Enable for SDXL", "Enable"]),
+    AxisOption("Size", str, apply_size),
 ]
 
 
@@ -437,13 +450,16 @@ class Script(scripts.Script):
             with gr.Column():
                 draw_legend = gr.Checkbox(label='Draw legend', value=True, elem_id=self.elem_id("draw_legend"))
                 no_fixed_seeds = gr.Checkbox(label='Keep -1 for seeds', value=False, elem_id=self.elem_id("no_fixed_seeds"))
+                with gr.Row():
+                    vary_seeds_x = gr.Checkbox(label='Vary seeds for X', value=False, min_width=80, elem_id=self.elem_id("vary_seeds_x"), tooltip="Use different seeds for images along X axis.")
+                    vary_seeds_y = gr.Checkbox(label='Vary seeds for Y', value=False, min_width=80, elem_id=self.elem_id("vary_seeds_y"), tooltip="Use different seeds for images along Y axis.")
+                    vary_seeds_z = gr.Checkbox(label='Vary seeds for Z', value=False, min_width=80, elem_id=self.elem_id("vary_seeds_z"), tooltip="Use different seeds for images along Z axis.")
             with gr.Column():
                 include_lone_images = gr.Checkbox(label='Include Sub Images', value=False, elem_id=self.elem_id("include_lone_images"))
                 include_sub_grids = gr.Checkbox(label='Include Sub Grids', value=False, elem_id=self.elem_id("include_sub_grids"))
+                csv_mode = gr.Checkbox(label='Use text inputs instead of dropdowns', value=False, elem_id=self.elem_id("csv_mode"))
             with gr.Column():
                 margin_size = gr.Slider(label="Grid margins (px)", minimum=0, maximum=500, value=0, step=2, elem_id=self.elem_id("margin_size"))
-            with gr.Column():
-                csv_mode = gr.Checkbox(label='Use text inputs instead of dropdowns', value=False, elem_id=self.elem_id("csv_mode"))
 
         with gr.Row(variant="compact", elem_id="swap_axes"):
             swap_xy_axes_button = gr.Button(value="Swap X/Y axes", elem_id="xy_grid_swap_axes_button")
@@ -475,6 +491,8 @@ class Script(scripts.Script):
         fill_z_button.click(fn=fill, inputs=[z_type, csv_mode], outputs=[z_values, z_values_dropdown])
 
         def select_axis(axis_type, axis_values, axis_values_dropdown, csv_mode):
+            axis_type = axis_type or 0  # if axle type is None set to 0
+
             choices = self.current_axis_options[axis_type].choices
             has_choices = choices is not None
 
@@ -522,9 +540,11 @@ class Script(scripts.Script):
             (z_values_dropdown, lambda params: get_dropdown_update_from_params("Z", params)),
         )
 
-        return [x_type, x_values, x_values_dropdown, y_type, y_values, y_values_dropdown, z_type, z_values, z_values_dropdown, draw_legend, include_lone_images, include_sub_grids, no_fixed_seeds, margin_size, csv_mode]
+        return [x_type, x_values, x_values_dropdown, y_type, y_values, y_values_dropdown, z_type, z_values, z_values_dropdown, draw_legend, include_lone_images, include_sub_grids, no_fixed_seeds, vary_seeds_x, vary_seeds_y, vary_seeds_z, margin_size, csv_mode]
 
-    def run(self, p, x_type, x_values, x_values_dropdown, y_type, y_values, y_values_dropdown, z_type, z_values, z_values_dropdown, draw_legend, include_lone_images, include_sub_grids, no_fixed_seeds, margin_size, csv_mode):
+    def run(self, p, x_type, x_values, x_values_dropdown, y_type, y_values, y_values_dropdown, z_type, z_values, z_values_dropdown, draw_legend, include_lone_images, include_sub_grids, no_fixed_seeds, vary_seeds_x, vary_seeds_y, vary_seeds_z, margin_size, csv_mode):
+        x_type, y_type, z_type = x_type or 0, y_type or 0, z_type or 0  # if axle type is None set to 0
+
         if not no_fixed_seeds:
             modules.processing.fix_seed(p)
 
@@ -546,6 +566,8 @@ class Script(scripts.Script):
                 valslist_ext = []
 
                 for val in valslist:
+                    if val.strip() == '':
+                        continue
                     m = re_range.fullmatch(val)
                     mc = re_range_count.fullmatch(val)
                     if m is not None:
@@ -568,6 +590,8 @@ class Script(scripts.Script):
                 valslist_ext = []
 
                 for val in valslist:
+                    if val.strip() == '':
+                        continue
                     m = re_range_float.fullmatch(val)
                     mc = re_range_count_float.fullmatch(val)
                     if m is not None:
@@ -688,7 +712,7 @@ class Script(scripts.Script):
         grid_infotext = [None] * (1 + len(zs))
 
         def cell(x, y, z, ix, iy, iz):
-            if shared.state.interrupted:
+            if shared.state.interrupted or state.stopping_generation:
                 return Processed(p, [], p.seed, "")
 
             pc = copy(p)
@@ -696,6 +720,16 @@ class Script(scripts.Script):
             x_opt.apply(pc, x, xs)
             y_opt.apply(pc, y, ys)
             z_opt.apply(pc, z, zs)
+
+            xdim = len(xs) if vary_seeds_x else 1
+            ydim = len(ys) if vary_seeds_y else 1
+
+            if vary_seeds_x:
+               pc.seed += ix
+            if vary_seeds_y:
+               pc.seed += iy * xdim
+            if vary_seeds_z:
+               pc.seed += iz * xdim * ydim
 
             try:
                 res = process_images(pc)

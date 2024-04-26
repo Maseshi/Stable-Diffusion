@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import configparser
+import dataclasses
 import os
 import threading
 import re
@@ -8,6 +9,10 @@ import re
 from modules import shared, errors, cache, scripts
 from modules.gitpython_hack import Repo
 from modules.paths_internal import extensions_dir, extensions_builtin_dir, script_path  # noqa: F401
+
+extensions: list[Extension] = []
+extension_paths: dict[str, Extension] = {}
+loaded_extensions: dict[str, Exception] = {}
 
 
 os.makedirs(extensions_dir, exist_ok=True)
@@ -22,6 +27,13 @@ def active():
         return [x for x in extensions if x.enabled]
 
 
+@dataclasses.dataclass
+class CallbackOrderInfo:
+    name: str
+    before: list
+    after: list
+
+
 class ExtensionMetadata:
     filename = "metadata.ini"
     config: configparser.ConfigParser
@@ -32,16 +44,17 @@ class ExtensionMetadata:
         self.config = configparser.ConfigParser()
 
         filepath = os.path.join(path, self.filename)
-        if os.path.isfile(filepath):
-            try:
-                self.config.read(filepath)
-            except Exception:
-                errors.report(f"Error reading {self.filename} for extension {canonical_name}.", exc_info=True)
+        # `self.config.read()` will quietly swallow OSErrors (which FileNotFoundError is),
+        # so no need to check whether the file exists beforehand.
+        try:
+            self.config.read(filepath)
+        except Exception:
+            errors.report(f"Error reading {self.filename} for extension {canonical_name}.", exc_info=True)
 
         self.canonical_name = self.config.get("Extension", "Name", fallback=canonical_name)
         self.canonical_name = canonical_name.lower().strip()
 
-        self.requires = self.get_script_requirements("Requires", "Extension")
+        self.requires = None
 
     def get_script_requirements(self, field, section, extra_section=None):
         """reads a list of requirements from the config; field is the name of the field in the ini file,
@@ -53,7 +66,15 @@ class ExtensionMetadata:
         if extra_section:
             x = x + ', ' + self.config.get(extra_section, field, fallback='')
 
-        return self.parse_list(x.lower())
+        listed_requirements = self.parse_list(x.lower())
+        res = []
+
+        for requirement in listed_requirements:
+            loaded_requirements = (x for x in requirement.split("|") if x in loaded_extensions)
+            relevant_requirement = next(loaded_requirements, requirement)
+            res.append(relevant_requirement)
+
+        return res
 
     def parse_list(self, text):
         """converts a line from config ("ext1 ext2, ext3  ") into a python list (["ext1", "ext2", "ext3"])"""
@@ -63,6 +84,22 @@ class ExtensionMetadata:
 
         # both "," and " " are accepted as separator
         return [x for x in re.split(r"[,\s]+", text.strip()) if x]
+
+    def list_callback_order_instructions(self):
+        for section in self.config.sections():
+            if not section.startswith("callbacks/"):
+                continue
+
+            callback_name = section[10:]
+
+            if not callback_name.startswith(self.canonical_name):
+                errors.report(f"Callback order section for extension {self.canonical_name} is referencing the wrong extension: {section}")
+                continue
+
+            before = self.parse_list(self.config.get(section, 'Before', fallback=''))
+            after = self.parse_list(self.config.get(section, 'After', fallback=''))
+
+            yield CallbackOrderInfo(callback_name, before, after)
 
 
 class Extension:
@@ -155,6 +192,8 @@ class Extension:
     def check_updates(self):
         repo = Repo(self.path)
         for fetch in repo.remote().fetch(dry_run=True):
+            if self.branch and fetch.name != f'{repo.remote().name}/{self.branch}':
+                continue
             if fetch.flags != fetch.HEAD_UPTODATE:
                 self.can_update = True
                 self.status = "new commits"
@@ -185,6 +224,8 @@ class Extension:
 
 def list_extensions():
     extensions.clear()
+    extension_paths.clear()
+    loaded_extensions.clear()
 
     if shared.cmd_opts.disable_all_extensions:
         print("*** \"--disable-all-extensions\" arg was used, will not load any extensions ***")
@@ -195,7 +236,6 @@ def list_extensions():
     elif shared.opts.disable_all_extensions == "extra":
         print("*** \"Disable all extensions\" option was set, will only load built-in extensions ***")
 
-    loaded_extensions = {}
 
     # scan through extensions directory and load metadata
     for dirname in [extensions_builtin_dir, extensions_dir]:
@@ -219,19 +259,38 @@ def list_extensions():
             is_builtin = dirname == extensions_builtin_dir
             extension = Extension(name=extension_dirname, path=path, enabled=extension_dirname not in shared.opts.disabled_extensions, is_builtin=is_builtin, metadata=metadata)
             extensions.append(extension)
+            extension_paths[extension.path] = extension
             loaded_extensions[canonical_name] = extension
+
+    for extension in extensions:
+        extension.metadata.requires = extension.metadata.get_script_requirements("Requires", "Extension")
 
     # check for requirements
     for extension in extensions:
+        if not extension.enabled:
+            continue
+
         for req in extension.metadata.requires:
             required_extension = loaded_extensions.get(req)
             if required_extension is None:
                 errors.report(f'Extension "{extension.name}" requires "{req}" which is not installed.', exc_info=False)
                 continue
 
-            if not extension.enabled:
+            if not required_extension.enabled:
                 errors.report(f'Extension "{extension.name}" requires "{required_extension.name}" which is disabled.', exc_info=False)
                 continue
 
 
-extensions: list[Extension] = []
+def find_extension(filename):
+    parentdir = os.path.dirname(os.path.realpath(filename))
+
+    while parentdir != filename:
+        extension = extension_paths.get(parentdir)
+        if extension is not None:
+            return extension
+
+        filename = parentdir
+        parentdir = os.path.dirname(filename)
+
+    return None
+

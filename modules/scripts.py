@@ -7,15 +7,37 @@ from dataclasses import dataclass
 
 import gradio as gr
 
-from modules import shared, paths, script_callbacks, extensions, script_loading, scripts_postprocessing, errors, timer
+from modules import shared, paths, script_callbacks, extensions, script_loading, scripts_postprocessing, errors, timer, util
+
+topological_sort = util.topological_sort
 
 AlwaysVisible = object()
 
+class MaskBlendArgs:
+    def __init__(self, current_latent, nmask, init_latent, mask, blended_latent, denoiser=None, sigma=None):
+        self.current_latent = current_latent
+        self.nmask = nmask
+        self.init_latent = init_latent
+        self.mask = mask
+        self.blended_latent = blended_latent
+
+        self.denoiser = denoiser
+        self.is_final_blend = denoiser is None
+        self.sigma = sigma
+
+class PostSampleArgs:
+    def __init__(self, samples):
+        self.samples = samples
 
 class PostprocessImageArgs:
     def __init__(self, image):
         self.image = image
 
+class PostProcessMaskOverlayArgs:
+    def __init__(self, index, mask_for_overlay, overlay_image):
+        self.index = index
+        self.mask_for_overlay = mask_for_overlay
+        self.overlay_image = overlay_image
 
 class PostprocessBatchListArgs:
     def __init__(self, images):
@@ -71,6 +93,9 @@ class Script:
     setup_for_ui_only = False
     """If true, the script setup will only be run in Gradio UI, not in API"""
 
+    controls = None
+    """A list of controls returned by the ui()."""
+
     def title(self):
         """this function should return the title of the script. This is what will be displayed in the dropdown menu."""
 
@@ -86,7 +111,7 @@ class Script:
 
     def show(self, is_img2img):
         """
-        is_img2img is True if this function is called for the img2img interface, and Fasle otherwise
+        is_img2img is True if this function is called for the img2img interface, and False otherwise
 
         This function should return:
          - False if the script should not be shown in UI at all
@@ -114,7 +139,6 @@ class Script:
         args contains all values returned by components from ui().
         """
         pass
-
 
     def before_process(self, p, *args):
         """
@@ -206,9 +230,44 @@ class Script:
 
         pass
 
+    def on_mask_blend(self, p, mba: MaskBlendArgs, *args):
+        """
+        Called in inpainting mode when the original content is blended with the inpainted content.
+        This is called at every step in the denoising process and once at the end.
+        If is_final_blend is true, this is called for the final blending stage.
+        Otherwise, denoiser and sigma are defined and may be used to inform the procedure.
+        """
+
+        pass
+
+    def post_sample(self, p, ps: PostSampleArgs, *args):
+        """
+        Called after the samples have been generated,
+        but before they have been decoded by the VAE, if applicable.
+        Check getattr(samples, 'already_decoded', False) to test if the images are decoded.
+        """
+
+        pass
+
     def postprocess_image(self, p, pp: PostprocessImageArgs, *args):
         """
         Called for every image after it has been generated.
+        """
+
+        pass
+
+    def postprocess_maskoverlay(self, p, ppmo: PostProcessMaskOverlayArgs, *args):
+        """
+        Called for every image after it has been generated.
+        """
+
+        pass
+
+    def postprocess_image_after_composite(self, p, pp: PostprocessImageArgs, *args):
+        """
+        Called for every image after it has been generated.
+        Same as postprocess_image but after inpaint_full_res composite
+        So that it operates on the full image instead of the inpaint_full_res crop region.
         """
 
         pass
@@ -293,6 +352,9 @@ class ScriptBuiltinUI(Script):
 
         return f'{tabname}{item_id}'
 
+    def show(self, is_img2img):
+        return AlwaysVisible
+
 
 current_basedir = paths.script_path
 
@@ -310,29 +372,6 @@ ScriptFile = namedtuple("ScriptFile", ["basedir", "filename", "path"])
 scripts_data = []
 postprocessing_scripts_data = []
 ScriptClassData = namedtuple("ScriptClassData", ["script_class", "path", "basedir", "module"])
-
-def topological_sort(dependencies):
-    """Accepts a dictionary mapping name to its dependencies, returns a list of names ordered according to dependencies.
-    Ignores errors relating to missing dependeencies or circular dependencies
-    """
-
-    visited = {}
-    result = []
-
-    def inner(name):
-        visited[name] = True
-
-        for dep in dependencies.get(name, []):
-            if dep in dependencies and dep not in visited:
-                inner(dep)
-
-        result.append(name)
-
-    for depname in dependencies:
-        if depname not in visited:
-            inner(depname)
-
-    return result
 
 
 @dataclass
@@ -504,6 +543,25 @@ class ScriptRunner:
         self.paste_field_names = []
         self.inputs = [None]
 
+        self.callback_map = {}
+        self.callback_names = [
+            'before_process',
+            'process',
+            'before_process_batch',
+            'after_extra_networks_activate',
+            'process_batch',
+            'postprocess',
+            'postprocess_batch',
+            'postprocess_batch_list',
+            'post_sample',
+            'on_mask_blend',
+            'postprocess_image',
+            'postprocess_maskoverlay',
+            'postprocess_image_after_composite',
+            'before_component',
+            'after_component',
+        ]
+
         self.on_before_component_elem_id = {}
         """dict of callbacks to be called before an element is created; key=elem_id, value=list of callbacks"""
 
@@ -520,7 +578,12 @@ class ScriptRunner:
         auto_processing_scripts = scripts_auto_postprocessing.create_auto_preprocessing_script_data()
 
         for script_data in auto_processing_scripts + scripts_data:
-            script = script_data.script_class()
+            try:
+                script = script_data.script_class()
+            except Exception:
+                errors.report(f"Error # failed to initialize Script {script_data.module}: ", exc_info=True)
+                continue
+
             script.filename = script_data.path
             script.is_txt2img = not is_img2img
             script.is_img2img = is_img2img
@@ -536,6 +599,8 @@ class ScriptRunner:
             elif visibility:
                 self.scripts.append(script)
                 self.selectable_scripts.append(script)
+
+        self.callback_map.clear()
 
         self.apply_on_before_component_callbacks()
 
@@ -573,6 +638,7 @@ class ScriptRunner:
         import modules.api.models as api_models
 
         controls = wrap_call(script.ui, script.filename, "ui", script.is_img2img)
+        script.controls = controls
 
         if controls is None:
             return
@@ -645,6 +711,8 @@ class ScriptRunner:
         self.setup_ui_for_section(None, self.selectable_scripts)
 
         def select_script(script_index):
+            if script_index is None:
+                script_index = 0
             selected_script = self.selectable_scripts[script_index - 1] if script_index>0 else None
 
             return [gr.update(visible=selected_script == s) for s in self.selectable_scripts]
@@ -671,12 +739,17 @@ class ScriptRunner:
         def onload_script_visibility(params):
             title = params.get('Script', None)
             if title:
-                title_index = self.titles.index(title)
-                visibility = title_index == self.script_load_ctr
-                self.script_load_ctr = (self.script_load_ctr + 1) % len(self.titles)
-                return gr.update(visible=visibility)
-            else:
-                return gr.update(visible=False)
+                try:
+                    title_index = self.titles.index(title)
+                    visibility = title_index == self.script_load_ctr
+                    self.script_load_ctr = (self.script_load_ctr + 1) % len(self.titles)
+                    return gr.update(visible=visibility)
+                except ValueError:
+                    params['Script'] = None
+                    massage = f'Cannot find Script: "{title}"'
+                    print(massage)
+                    gr.Warning(massage)
+            return gr.update(visible=False)
 
         self.infotext_fields.append((dropdown, lambda x: gr.update(value=x.get('Script', 'None'))))
         self.infotext_fields.extend([(script.group, onload_script_visibility) for script in self.selectable_scripts])
@@ -688,7 +761,7 @@ class ScriptRunner:
     def run(self, p, *args):
         script_index = args[0]
 
-        if script_index == 0:
+        if script_index == 0 or script_index is None:
             return None
 
         script = self.selectable_scripts[script_index-1]
@@ -703,8 +776,42 @@ class ScriptRunner:
 
         return processed
 
+    def list_scripts_for_method(self, method_name):
+        if method_name in ('before_component', 'after_component'):
+            return self.scripts
+        else:
+            return self.alwayson_scripts
+
+    def create_ordered_callbacks_list(self,  method_name, *, enable_user_sort=True):
+        script_list = self.list_scripts_for_method(method_name)
+        category = f'script_{method_name}'
+        callbacks = []
+
+        for script in script_list:
+            if getattr(script.__class__, method_name, None) == getattr(Script, method_name, None):
+                continue
+
+            script_callbacks.add_callback(callbacks, script, category=category, name=script.__class__.__name__, filename=script.filename)
+
+        return script_callbacks.sort_callbacks(category, callbacks, enable_user_sort=enable_user_sort)
+
+    def ordered_callbacks(self, method_name, *, enable_user_sort=True):
+        script_list = self.list_scripts_for_method(method_name)
+        category = f'script_{method_name}'
+
+        scrpts_len, callbacks = self.callback_map.get(category, (-1, None))
+
+        if callbacks is None or scrpts_len != len(script_list):
+            callbacks = self.create_ordered_callbacks_list(method_name, enable_user_sort=enable_user_sort)
+            self.callback_map[category] = len(script_list), callbacks
+
+        return callbacks
+
+    def ordered_scripts(self, method_name):
+        return [x.callback for x in self.ordered_callbacks(method_name)]
+
     def before_process(self, p):
-        for script in self.alwayson_scripts:
+        for script in self.ordered_scripts('before_process'):
             try:
                 script_args = p.script_args[script.args_from:script.args_to]
                 script.before_process(p, *script_args)
@@ -712,7 +819,7 @@ class ScriptRunner:
                 errors.report(f"Error running before_process: {script.filename}", exc_info=True)
 
     def process(self, p):
-        for script in self.alwayson_scripts:
+        for script in self.ordered_scripts('process'):
             try:
                 script_args = p.script_args[script.args_from:script.args_to]
                 script.process(p, *script_args)
@@ -720,7 +827,7 @@ class ScriptRunner:
                 errors.report(f"Error running process: {script.filename}", exc_info=True)
 
     def before_process_batch(self, p, **kwargs):
-        for script in self.alwayson_scripts:
+        for script in self.ordered_scripts('before_process_batch'):
             try:
                 script_args = p.script_args[script.args_from:script.args_to]
                 script.before_process_batch(p, *script_args, **kwargs)
@@ -728,7 +835,7 @@ class ScriptRunner:
                 errors.report(f"Error running before_process_batch: {script.filename}", exc_info=True)
 
     def after_extra_networks_activate(self, p, **kwargs):
-        for script in self.alwayson_scripts:
+        for script in self.ordered_scripts('after_extra_networks_activate'):
             try:
                 script_args = p.script_args[script.args_from:script.args_to]
                 script.after_extra_networks_activate(p, *script_args, **kwargs)
@@ -736,7 +843,7 @@ class ScriptRunner:
                 errors.report(f"Error running after_extra_networks_activate: {script.filename}", exc_info=True)
 
     def process_batch(self, p, **kwargs):
-        for script in self.alwayson_scripts:
+        for script in self.ordered_scripts('process_batch'):
             try:
                 script_args = p.script_args[script.args_from:script.args_to]
                 script.process_batch(p, *script_args, **kwargs)
@@ -744,7 +851,7 @@ class ScriptRunner:
                 errors.report(f"Error running process_batch: {script.filename}", exc_info=True)
 
     def postprocess(self, p, processed):
-        for script in self.alwayson_scripts:
+        for script in self.ordered_scripts('postprocess'):
             try:
                 script_args = p.script_args[script.args_from:script.args_to]
                 script.postprocess(p, processed, *script_args)
@@ -752,7 +859,7 @@ class ScriptRunner:
                 errors.report(f"Error running postprocess: {script.filename}", exc_info=True)
 
     def postprocess_batch(self, p, images, **kwargs):
-        for script in self.alwayson_scripts:
+        for script in self.ordered_scripts('postprocess_batch'):
             try:
                 script_args = p.script_args[script.args_from:script.args_to]
                 script.postprocess_batch(p, *script_args, images=images, **kwargs)
@@ -760,20 +867,52 @@ class ScriptRunner:
                 errors.report(f"Error running postprocess_batch: {script.filename}", exc_info=True)
 
     def postprocess_batch_list(self, p, pp: PostprocessBatchListArgs, **kwargs):
-        for script in self.alwayson_scripts:
+        for script in self.ordered_scripts('postprocess_batch_list'):
             try:
                 script_args = p.script_args[script.args_from:script.args_to]
                 script.postprocess_batch_list(p, pp, *script_args, **kwargs)
             except Exception:
                 errors.report(f"Error running postprocess_batch_list: {script.filename}", exc_info=True)
 
+    def post_sample(self, p, ps: PostSampleArgs):
+        for script in self.ordered_scripts('post_sample'):
+            try:
+                script_args = p.script_args[script.args_from:script.args_to]
+                script.post_sample(p, ps, *script_args)
+            except Exception:
+                errors.report(f"Error running post_sample: {script.filename}", exc_info=True)
+
+    def on_mask_blend(self, p, mba: MaskBlendArgs):
+        for script in self.ordered_scripts('on_mask_blend'):
+            try:
+                script_args = p.script_args[script.args_from:script.args_to]
+                script.on_mask_blend(p, mba, *script_args)
+            except Exception:
+                errors.report(f"Error running post_sample: {script.filename}", exc_info=True)
+
     def postprocess_image(self, p, pp: PostprocessImageArgs):
-        for script in self.alwayson_scripts:
+        for script in self.ordered_scripts('postprocess_image'):
             try:
                 script_args = p.script_args[script.args_from:script.args_to]
                 script.postprocess_image(p, pp, *script_args)
             except Exception:
                 errors.report(f"Error running postprocess_image: {script.filename}", exc_info=True)
+
+    def postprocess_maskoverlay(self, p, ppmo: PostProcessMaskOverlayArgs):
+        for script in self.ordered_scripts('postprocess_maskoverlay'):
+            try:
+                script_args = p.script_args[script.args_from:script.args_to]
+                script.postprocess_maskoverlay(p, ppmo, *script_args)
+            except Exception:
+                errors.report(f"Error running postprocess_image: {script.filename}", exc_info=True)
+
+    def postprocess_image_after_composite(self, p, pp: PostprocessImageArgs):
+        for script in self.ordered_scripts('postprocess_image_after_composite'):
+            try:
+                script_args = p.script_args[script.args_from:script.args_to]
+                script.postprocess_image_after_composite(p, pp, *script_args)
+            except Exception:
+                errors.report(f"Error running postprocess_image_after_composite: {script.filename}", exc_info=True)
 
     def before_component(self, component, **kwargs):
         for callback, script in self.on_before_component_elem_id.get(kwargs.get("elem_id"), []):
@@ -782,7 +921,7 @@ class ScriptRunner:
             except Exception:
                 errors.report(f"Error running on_before_component: {script.filename}", exc_info=True)
 
-        for script in self.scripts:
+        for script in self.ordered_scripts('before_component'):
             try:
                 script.before_component(component, **kwargs)
             except Exception:
@@ -795,7 +934,7 @@ class ScriptRunner:
             except Exception:
                 errors.report(f"Error running on_after_component: {script.filename}", exc_info=True)
 
-        for script in self.scripts:
+        for script in self.ordered_scripts('after_component'):
             try:
                 script.after_component(component, **kwargs)
             except Exception:
@@ -823,7 +962,7 @@ class ScriptRunner:
                     self.scripts[si].args_to = args_to
 
     def before_hr(self, p):
-        for script in self.alwayson_scripts:
+        for script in self.ordered_scripts('before_hr'):
             try:
                 script_args = p.script_args[script.args_from:script.args_to]
                 script.before_hr(p, *script_args)
@@ -831,7 +970,7 @@ class ScriptRunner:
                 errors.report(f"Error running before_hr: {script.filename}", exc_info=True)
 
     def setup_scrips(self, p, *, is_ui=True):
-        for script in self.alwayson_scripts:
+        for script in self.ordered_scripts('setup'):
             if not is_ui and script.setup_for_ui_only:
                 continue
 
@@ -840,6 +979,35 @@ class ScriptRunner:
                 script.setup(p, *script_args)
             except Exception:
                 errors.report(f"Error running setup: {script.filename}", exc_info=True)
+
+    def set_named_arg(self, args, script_name, arg_elem_id, value, fuzzy=False):
+        """Locate an arg of a specific script in script_args and set its value
+        Args:
+            args: all script args of process p, p.script_args
+            script_name: the name target script name to
+            arg_elem_id: the elem_id of the target arg
+            value: the value to set
+            fuzzy: if True, arg_elem_id can be a substring of the control.elem_id else exact match
+        Returns:
+            Updated script args
+        when script_name in not found or arg_elem_id is not found in script controls, raise RuntimeError
+        """
+        script = next((x for x in self.scripts if x.name == script_name), None)
+        if script is None:
+            raise RuntimeError(f"script {script_name} not found")
+
+        for i, control in enumerate(script.controls):
+            if arg_elem_id in control.elem_id if fuzzy else arg_elem_id == control.elem_id:
+                index = script.args_from + i
+
+                if isinstance(args, tuple):
+                    return args[:index] + (value,) + args[index + 1:]
+                elif isinstance(args, list):
+                    args[index] = value
+                    return args
+                else:
+                    raise RuntimeError(f"args is not a list or tuple, but {type(args)}")
+        raise RuntimeError(f"arg_elem_id {arg_elem_id} not found in script {script_name}")
 
 
 scripts_txt2img: ScriptRunner = None
